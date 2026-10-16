@@ -1,3 +1,5 @@
+import { caps } from './capabilities'
+
 /**
  * Filler speech.
  *
@@ -63,9 +65,21 @@ function makePicker(pool: string[]) {
   }
 }
 
-export const working = makePicker(WORKING)
-export const acknowledge = makePicker(ACKNOWLEDGE)
-export const attention = makePicker(ATTENTION)
+/** The same lines when Settings has him speaking Georgian. Same rules: short, no enthusiasm, ბატონო at the end. */
+const WORKING_KA = ['ვამოწმებ.', 'ვეძებ.', 'მუშავდება, ბატონო.', 'ვამუშავებ.', 'ვიწყებ.']
+const ACKNOWLEDGE_KA = ['როგორც გნებავთ, ბატონო.', 'გასაგებია.', 'კარგით, ბატონო.', 'შესრულდება.']
+const ATTENTION_KA = ['დიახ, ბატონო?', 'ბატონო?', 'გისმენთ, ბატონო.', 'მზად ვარ.']
+
+const georgian = () => caps().language === 'ka'
+const bilingual = (en: string[], ka: string[]) => {
+  const pickEn = makePicker(en)
+  const pickKa = makePicker(ka)
+  return () => (georgian() ? pickKa() : pickEn())
+}
+
+export const working = bilingual(WORKING, WORKING_KA)
+export const acknowledge = bilingual(ACKNOWLEDGE, ACKNOWLEDGE_KA)
+export const attention = bilingual(ATTENTION, ATTENTION_KA)
 
 /**
  * Naming the task is warmer than a generic acknowledgement and shows the
@@ -188,6 +202,7 @@ function split(toolName: string): { server: string; tool: string } {
 
 /** A phrase suited to the tool that just fired. */
 export function forTool(toolName: string): string {
+  if (georgian()) return working()
   const { server, tool } = split(toolName)
   for (const r of pickers) {
     const hit =

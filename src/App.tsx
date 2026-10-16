@@ -2,10 +2,12 @@ import { useEffect, useRef } from 'react'
 import { Scene } from './scene/Scene'
 import { Hud } from './ui/Hud'
 import { Boot } from './ui/Boot'
+import { introFinished } from './lib/intro'
+import { applyAudioPrefs } from './lib/applyPrefs'
 import { Ignition } from './ui/Ignition'
 import { Diagnostics } from './ui/Diagnostics'
 import { useStore } from './store'
-import { startVoice, type Voice, type VoiceMode } from './lib/voice'
+import { NAME_KA, startVoice, type Voice, type VoiceMode } from './lib/voice'
 import { createSpeaker, cycleVoice, currentVoiceName } from './lib/tts'
 import * as sfx from './lib/sfx'
 import * as music from './lib/music'
@@ -23,15 +25,17 @@ import {
   watchPanels,
   watchBlades,
   watchCapture,
+  watchConfirm,
   watchUi,
+  watchReminders,
   watchConnection,
   connectedLabels,
   usingBridge,
   type Msg,
 } from './lib/brain'
 import { startAnalyser, micLevel } from './lib/audio'
-import { probeCapabilities } from './lib/capabilities'
-import { env } from './config'
+import { caps, probeCapabilities } from './lib/capabilities'
+import { isLocked, requireUnlock, useLock } from './lib/lock'
 
 /**
  * The conversation.
@@ -42,8 +46,9 @@ import { env } from './config'
  * so there is no way for the user to get a word in.
  *
  * It is an event machine now. The voice loop runs continuously and pushes
- * events at us; every one of them is legal in every phase. Saying anything at
- * all stops him talking, and whatever you say next becomes the new turn.
+ * events at us; every one of them is legal in every phase. Saying "stop" or his
+ * name stops him talking (or any speech at all, with stop-words-only switched
+ * off in Settings), and whatever you say next becomes the new turn.
  */
 
 /** How long to wait for someone to start speaking after he wakes. Generous:
@@ -63,11 +68,48 @@ const newId = () =>
 
 /** The same mishearings voice.ts accepts for the wake word — otherwise a turn
  *  that woke him as "travis" gets that word sent on to the model as a question. */
-const NAME = '(?:jarvis|jarvys|jervis|travis|jarviss|java\'s|jarv)'
+const NAME = `(?:jarvis|jarvys|jervis|travis|jarviss|java's|jarv|${NAME_KA})`
+/** End of a word in any script — \b only knows A–Z, and Georgian is not in it. */
+const WORD_END = '(?![\\p{L}\\p{N}_])'
 /** A bare vocative — "Jarvis", "hey jarvis" — with nothing asked. */
-const BARE_NAME = new RegExp(`^(?:hey|hi|ok|okay|yo)?\\s*${NAME}[\\s,.!?]*$`, 'i')
+const BARE_NAME = new RegExp(`^(?:hey|hi|ok|okay|yo|ჰეი)?\\s*${NAME}[\\s,.!?]*$`, 'iu')
 /** A leading vocative on a real command: "Jarvis, what's the weather". */
-const LEADING_NAME = new RegExp(`^(?:hey|hi|ok|okay|yo)?\\s*${NAME}\\b[\\s,.:!?-]*`, 'i')
+const LEADING_NAME = new RegExp(`^(?:hey|hi|ok|okay|yo|ჰეი)?\\s*${NAME}${WORD_END}[\\s,.:!?-]*`, 'iu')
+
+/** Spoken answers to a confirmation. No is checked first: "no, go ahead" is
+ *  not a yes, and a wrong no costs a retry where a wrong yes cannot be undone. */
+const SAID_NO = new RegExp(
+  "^(i\\s+)?(no|nope|nah|cancel|stop|don'?t|do not|deny|denied|decline|negative|abort|never ?mind|" +
+    `არა|არ მინდა|არ გინდა|არ გააკეთო|გააუქმე|გაჩერდი|უარი)${WORD_END}`,
+  'iu',
+)
+const SAID_YES = new RegExp(
+  '^(i\\s+)?(yes|yeah|yep|yup|confirm(ed)?|approve(d)?|do it|go ahead|proceed|affirmative|okay|ok|sure|' +
+    `კი|დიახ|ჰო|ხო|კარგი|ვადასტურებ|დადასტურებულია|გააკეთე|თანახმა ვარ)${WORD_END}`,
+  'iu',
+)
+
+/** "Stop", "Jarvis, stop", "enough please" — be quiet, nothing asked. */
+const BARE_STOP = new RegExp(
+  `^(?:(?:hey|hi|ok|okay|yo|ჰეი)?\\s*${NAME}${WORD_END}[\\s,.!?]*)?` +
+    '(?:stop|enough|cancel|quiet|be quiet|shut up|სტოპ|[ა-ჰ]{0,2}ჩერდი(?:თ)?|კმარა|შეწყვიტე|გაჩუმდი|გააუქმე|(?:g?a)?[cçč]h?er ?d[ei]|kmara)' +
+    `(?:\\s+(?:it|that|talking|now|please|jarvis|ახლა|გეთაყვა))*[\\s,.!?]*$`,
+  'iu',
+)
+
+/** After a confirmation is answered, the rest of the answer is still arriving:
+ *  "yes… I confirm" reaches the recogniser as two utterances. For this long a
+ *  short trailing phrase is taken as part of the answer, not as a new
+ *  question — which would otherwise cut off the very action just approved. */
+const CONFIRM_TAIL_MS = 3000
+const CONFIRM_TAIL_WORDS = 4
+
+function confirmVerdict(text: string): boolean | null {
+  const said = text.replace(LEADING_NAME, '').replace(/^[\s,.!?]+/, '').trim()
+  if (SAID_NO.test(said)) return false
+  if (SAID_YES.test(said)) return true
+  return null
+}
 
 export default function App() {
   const store = useStore
@@ -85,6 +127,10 @@ export default function App() {
   const booting = useRef(false)
   const idleTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const voicePoll = useRef<ReturnType<typeof setInterval> | null>(null)
+  /** Resolves the confirmation on screen, if there is one. */
+  const answerConfirm = useRef<((approved: boolean) => void) | null>(null)
+  const confirmAnsweredAt = useRef(0)
+  const inConfirmTail = () => Date.now() - confirmAnsweredAt.current < CONFIRM_TAIL_MS
 
   // -- helpers --------------------------------------------------------------
 
@@ -99,6 +145,8 @@ export default function App() {
   }
 
   const goDormant = () => {
+    // Standing down is not consent.
+    answerConfirm.current?.(false)
     clearIdle()
     silence()
     turn.current++
@@ -222,6 +270,7 @@ export default function App() {
 
   /** What the voice loop should do with what it hears, derived from phase. */
   const mode = (): VoiceMode => {
+    if (isLocked()) return 'deaf'
     switch (store.getState().phase) {
       case 'offline':
       case 'boot':
@@ -238,7 +287,7 @@ export default function App() {
 
   const onWake = (trailing: string) => {
     const phase = store.getState().phase
-    if (phase === 'offline' || phase === 'boot') return
+    if (phase === 'offline' || phase === 'boot' || isLocked()) return
 
     store.getState().setError(null)
     sfx.play('wake')
@@ -269,6 +318,9 @@ export default function App() {
    */
   const onSpeechStart = () => {
     clearIdle()
+    // Waiting on a yes or no, or just given one: speech is the answer, not an
+    // interruption, so the turn that asked must not be cut off.
+    if (answerConfirm.current || inConfirmTail()) return
     const phase = store.getState().phase
     if (phase === 'offline' || phase === 'boot' || phase === 'dormant') return
 
@@ -292,6 +344,22 @@ export default function App() {
   const onUtterance = (text: string) => {
     const phase = store.getState().phase
     if (phase === 'offline' || phase === 'boot' || phase === 'dormant') return
+
+    // Only a clear yes or no settles a confirmation; anything else is ignored
+    // rather than taken as a new question or, worse, as consent.
+    if (answerConfirm.current) {
+      const verdict = confirmVerdict(text)
+      if (verdict !== null) answerConfirm.current(verdict)
+      return
+    }
+    if (inConfirmTail() && text.trim().split(/\s+/).length <= CONFIRM_TAIL_WORDS) return
+
+    // He has already gone quiet (that was the barge-in); sending "stop" on to
+    // the model as a question would only start him talking again.
+    if (BARE_STOP.test(text.trim())) {
+      listen(FOLLOW_UP_MS)
+      return
+    }
 
     // People keep using his name as a vocative once they're already talking to
     // him. Strip it rather than sending "jarvis" to the model as a question.
@@ -352,13 +420,13 @@ export default function App() {
     // Must happen inside the click handler — browsers won't start an
     // AudioContext or speech synthesis without a user gesture.
     await sfx.unlockAudio()
-    sfx.play('boot')
-    // The score. Must be started from inside this click handler for the same
-    // reason as the rest of the audio.
+    applyAudioPrefs()
+    // The score. Must be enabled from inside this click handler for the same
+    // reason as the rest of the audio. The intro film carries its own
+    // soundtrack, so the boot tone and start-up cues stay silent under it.
     music.enable()
-    music.playBoot()
-    music.startAmbient()
 
+    const intro = introFinished()
     s.setPhase('boot')
 
     watchServers((servers) => store.getState().setConnected(servers))
@@ -421,6 +489,52 @@ export default function App() {
       }
     })
 
+    /**
+     * JARVIS asking permission for something that cannot be taken back.
+     *
+     * The bridge decides which actions need this and will not run them without
+     * a yes from here. While the card is up the phase sits at 'listening', so
+     * speech is heard as the answer instead of barging in on the turn that
+     * asked. Silence until the bridge's deadline counts as no.
+     */
+    watchConfirm(
+      (req) =>
+        new Promise<boolean>((resolve) => {
+          answerConfirm.current?.(false)
+          const before = store.getState().phase
+          let settled = false
+          const answer = (approved: boolean) => {
+            if (settled) return
+            settled = true
+            confirmAnsweredAt.current = Date.now()
+            if (answerConfirm.current === answer) answerConfirm.current = null
+            const st = store.getState()
+            if (st.confirm?.id === req.id) st.setConfirm(null)
+            if (st.phase === 'listening') {
+              st.setPhase(before === 'speaking' || before === 'tooling' ? before : 'thinking')
+            }
+            resolve(approved)
+          }
+          answerConfirm.current = answer
+          const st = store.getState()
+          st.setConfirm({
+            id: req.id,
+            action: req.action,
+            detail: req.detail,
+            expires: Date.now() + req.timeoutMs,
+            answer,
+          })
+          clearIdle()
+          st.setPhase('listening')
+          sfx.play('listen')
+          const spk = speaker.current ?? createSpeaker()
+          spk.say(caps().language === 'ka' ? 'საჭიროა თქვენი დადასტურება, ბატონო.' : 'Your confirmation is required, sir.')
+        }),
+      (id) => {
+        if (store.getState().confirm?.id === id) answerConfirm.current?.(false)
+      },
+    )
+
     // The interface is JARVIS's to drive. These arrive out of band, pushed
     // mid-turn the way panels are, so a command can retint the reactor or put
     // something into orbit while he is still speaking the sentence about it.
@@ -449,6 +563,35 @@ export default function App() {
           console.warn('[jarvis] unknown ui op:', op, args)
       }
     })
+    // A reminder never talks over him or over a question on screen: it waits
+    // for the answer in progress to finish (up to two minutes), then speaks
+    // and leaves the mic open, so "snooze it ten minutes" needs no wake word.
+    watchReminders(async (r) => {
+      const busy = () => {
+        const st = store.getState()
+        return st.confirm !== null || ['boot', 'thinking', 'tooling', 'speaking'].includes(st.phase)
+      }
+      const deadline = Date.now() + 120_000
+      while (busy() && Date.now() < deadline) await new Promise((ok) => setTimeout(ok, 500))
+      if (store.getState().phase === 'offline' || isLocked()) return
+
+      const mine = ++turn.current
+      clearIdle()
+      silence()
+      const st = store.getState()
+      st.setError(null)
+      st.pushTurn({ id: newId(), role: 'jarvis', text: r.say })
+      st.setPhase('speaking')
+      sfx.play('wake')
+      const spk = createSpeaker()
+      speaker.current = spk
+      spk.say(r.say)
+      await spk.end()
+      if (mine !== turn.current) return
+      speaker.current = null
+      listen(FOLLOW_UP_MS)
+    })
+
     // In bridge mode the conversation lives in the agent session, which is tied
     // to the socket — so a drop silently wipes his memory while the transcript
     // on screen still shows it. Better to say so than to let him quietly forget.
@@ -462,12 +605,6 @@ export default function App() {
       }
     })
     const warming = warm().catch((err: Error) => s.setError(err.message))
-
-    if (!usingBridge && !env.anthropicKey) {
-      s.setError(
-        'No Anthropic API key — copy .env.example to .env.local and set VITE_ANTHROPIC_API_KEY.',
-      )
-    }
 
     // Pull the neural voice down during the boot sequence so the first
     // "Hey Jarvis" isn't waiting on an 86MB download. Deliberately not awaited
@@ -487,12 +624,17 @@ export default function App() {
       }, 200)
     }
 
-    // Long enough for the four-beat start-up sequence in Boot.tsx to play —
-    // status bar, rings, suit schematic, reactor power-up — before the live
-    // interface takes over. Kept a touch under the boot cue so the music is
-    // still rising as the reactor lands.
-    await new Promise((r) => setTimeout(r, 9200)) // boot sequence
+    // The intro film plays out (or is clicked away) before the live interface
+    // takes over.
+    await intro
     await warming
+
+    // The passcode, before the microphone opens or a word can reach the model.
+    // Out of 'boot' first: the intro film shows for as long as that phase lasts.
+    const unlocked = requireUnlock()
+    store.getState().setPhase('dormant')
+    await unlocked
+
     store.getState().setConnected(connectedLabels())
     store.getState().setVoice(currentVoiceName())
 
@@ -521,6 +663,7 @@ export default function App() {
       onSpeechStart,
       onPartial,
       onUtterance,
+      answering: () => !!answerConfirm.current || inConfirmTail(),
       onError: onVoiceError,
     })
 
@@ -558,6 +701,17 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [phase])
 
+  /**
+   * The desktop app (scripts/desktop.mjs) opens the page with ?autostart, in a
+   * Chrome profile that lets audio start without a click, so the icon — or
+   * signing in to Windows — brings him straight up. In an ordinary tab the
+   * browser still wants the click, and a refused boot leaves the button there.
+   */
+  useEffect(() => {
+    if (new URLSearchParams(window.location.search).has('autostart')) void powerOn()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   // -- level pump + keys ----------------------------------------------------
 
   useEffect(() => {
@@ -578,7 +732,24 @@ export default function App() {
 
     const onKey = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement)?.tagName
-      if (tag === 'INPUT' || tag === 'TEXTAREA') return
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
+      // The keypad owns the keyboard while locked (SecureAccess.tsx).
+      if (isLocked()) return
+
+      // A pending confirmation takes the keyboard: Y or Enter approves, N
+      // denies, and Space is held back so it can't start a turn over the top.
+      if (answerConfirm.current && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        const k = e.key.toLowerCase()
+        if (k === 'y' || k === 'enter' || k === 'n') {
+          e.preventDefault()
+          if (!e.repeat) answerConfirm.current(k !== 'n')
+          return
+        }
+        if (e.code === 'Space') {
+          e.preventDefault()
+          return
+        }
+      }
 
       // V auditions the next British voice installed on this machine. Which
       // ones exist varies per Mac, so hearing them beats trusting a ranking.
@@ -663,8 +834,12 @@ export default function App() {
       // a missed wake word doesn't cost a take.
       if (e.code !== 'Space' || e.repeat) return
       e.preventDefault()
+      talk()
+    }
 
+    const talk = () => {
       const phase = store.getState().phase
+      if (isLocked()) return
       if (phase === 'offline') {
         void powerOn()
       } else if (phase === 'boot') {
@@ -680,11 +855,45 @@ export default function App() {
         onWake('')
       }
     }
+
+    // The command deck's prompt bar and mic button. Typed text is treated
+    // exactly like speech: a pending confirmation only accepts a clear yes or
+    // no, and anything typed over an answer in flight interrupts it.
+    const onAsk = (e: Event) => {
+      const text = String((e as CustomEvent<string>).detail ?? '').trim()
+      const phase = store.getState().phase
+      if (!text || phase === 'offline' || phase === 'boot' || isLocked()) return
+      if (answerConfirm.current) {
+        const verdict = confirmVerdict(text)
+        if (verdict !== null) answerConfirm.current(verdict)
+        return
+      }
+      if (phase === 'thinking' || phase === 'tooling' || phase === 'speaking') onSpeechStart()
+      onWake(text)
+    }
+
     window.addEventListener('keydown', onKey)
+    window.addEventListener('jarvis:ask', onAsk)
+    window.addEventListener('jarvis:talk', talk)
+
+    // Locking mid-conversation (Settings → LOCK NOW) stands him down first,
+    // the camera included.
+    const unwatchLock = useLock.subscribe((s, prev) => {
+      if (!s.locked || prev.locked) return
+      if (store.getState().gestures) {
+        hands.disableHands()
+        store.getState().setGestures(false)
+      }
+      const phase = store.getState().phase
+      if (phase !== 'offline' && phase !== 'boot') goDormant()
+    })
 
     return () => {
+      unwatchLock()
       cancelAnimationFrame(raf)
       window.removeEventListener('keydown', onKey)
+      window.removeEventListener('jarvis:ask', onAsk)
+      window.removeEventListener('jarvis:talk', talk)
       clearIdle()
       if (voicePoll.current) clearInterval(voicePoll.current)
       voice.current?.stop()

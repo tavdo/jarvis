@@ -1,4 +1,4 @@
-import { createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk'
+import { tool, toolGroup } from './tools/registry.mjs'
 import { z } from 'zod'
 
 /**
@@ -71,14 +71,12 @@ than listing them. The user knows what their own hands look like.`
  *   Sends a request to the browser and resolves with its reply.
  */
 export function visionServer(ask) {
-  return createSdkMcpServer({
+  return toolGroup({
     name: 'jarvis_eyes',
-    version: '1.0.0',
+    label: 'camera',
     instructions:
       "The camera on the user's machine, pointed at them. Use it when they ask " +
       'you to look at something. It is not a sensor to poll; it is an act.',
-    // Behind tool search, "look at me" would find nothing and become an apology.
-    alwaysLoad: true,
     tools: [
       tool(
         'look',

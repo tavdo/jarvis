@@ -1,13 +1,11 @@
 import {
-  env,
   USE_ELEVENLABS,
-  BACKEND,
   TTS_ENGINE,
   KOKORO_VOICE,
   BRIDGE_HTTP_URL,
 } from '../config'
 import * as kokoro from './kokoro'
-import { caps } from './capabilities'
+import { caps, ttsProviderLabel } from './capabilities'
 
 /**
  * Speech output.
@@ -19,7 +17,7 @@ import { caps } from './capabilities'
  * conversation that gap is much more noticeable than the timbre.
  *
  * Either way, text is cut at sentence boundaries as it streams in and spoken a
- * sentence at a time, so JARVIS starts talking while Claude is still writing.
+ * sentence at a time, so JARVIS starts talking while the model is still writing.
  *
  * The queue is an explicit array with a single pump rather than a promise
  * chain. A chain cannot be cut: cancelling mid-sentence left the chain's tail
@@ -46,12 +44,19 @@ type Speaker = {
 // ---------------------------------------------------------------------------
 
 let speaking = ''
-let recent = ''
-let recentUntil = 0
+/** What he said before the current sentence, each with when it was finished. */
+let recent: { text: string; at: number }[] = []
 
 /** Recognition lags the speakers by a few hundred milliseconds, so a sentence
  *  keeps arriving at the microphone well after it has finished playing. */
 const ECHO_TAIL_MS = 1800
+/**
+ * While he is still talking, how far back his own words can come back.
+ * Chrome's recogniser holds an unbroken stretch of speech as an interim result
+ * and can hand over a word from fifteen seconds earlier as he starts the next
+ * sentence; measured, that late word was what cut long answers off.
+ */
+const ECHO_MEMORY_MS = 30_000
 
 /**
  * Why you cannot hear him.
@@ -112,16 +117,12 @@ export function speakingSince(): number {
 }
 
 function setSpeaking(text: string) {
-  if (text) {
-    speaking = text
-    speakingAt = Date.now()
-    return
+  const now = Date.now()
+  if (speaking && speaking !== text) {
+    recent = [...recent.filter((r) => now - r.at < ECHO_MEMORY_MS), { text: speaking, at: now }]
   }
-  if (speaking) {
-    recent = speaking
-    recentUntil = Date.now() + ECHO_TAIL_MS
-  }
-  speaking = ''
+  speaking = text
+  if (text) speakingAt = now
 }
 
 /**
@@ -129,13 +130,16 @@ function setSpeaking(text: string) {
  *
  * The voice loop reads this to recognise itself: the mic stays open while he
  * talks, so it hears every word he says and would otherwise treat his own
- * answer as a barge-in. Includes a short tail of the previous sentence,
- * because the gap between two sentences is exactly when the echo of the first
- * one lands. See `isEcho` in voice.ts.
+ * answer as a barge-in. While he talks that includes everything he said in the
+ * last half-minute (see ECHO_MEMORY_MS); once he stops, only a short tail of
+ * his last sentence, so a follow-up that reuses his words is not taken for his
+ * echo. See `isEcho` in voice.ts.
  */
 export function speakingNow(): string {
-  const tail = Date.now() < recentUntil ? recent : ''
-  return `${speaking} ${tail}`.trim()
+  const now = Date.now()
+  const span = speaking ? ECHO_MEMORY_MS : ECHO_TAIL_MS
+  const earlier = recent.filter((r) => now - r.at < span).map((r) => r.text)
+  return [speaking, ...earlier].join(' ').trim()
 }
 
 // ---------------------------------------------------------------------------
@@ -157,6 +161,29 @@ const ABBREVIATION =
  * many characters, cut at the last word boundary and start talking.
  */
 const MAX_UNSPOKEN = 220
+
+/**
+ * The longest piece handed to a voice in one go. Google's online voices fetch
+ * the whole piece before the first word, so a 400-character sentence could
+ * miss the start-up watchdog and be skipped. Cut at a clause where possible,
+ * so the seam sounds like a breath rather than a stumble.
+ */
+const MAX_PIECE = 180
+
+function pieces(text: string): string[] {
+  const out: string[] = []
+  let rest = text.trim()
+  while (rest.length > MAX_PIECE) {
+    const win = rest.slice(0, MAX_PIECE + 1)
+    let cut = Math.max(win.lastIndexOf(', '), win.lastIndexOf('; '), win.lastIndexOf(': '), win.lastIndexOf(' — '), win.lastIndexOf(' – '))
+    cut = cut >= 60 ? cut + 1 : win.lastIndexOf(' ')
+    if (cut < 40) cut = MAX_PIECE
+    out.push(rest.slice(0, cut).trim())
+    rest = rest.slice(cut).trim()
+  }
+  if (rest) out.push(rest)
+  return out
+}
 
 // ---------------------------------------------------------------------------
 // Voice selection
@@ -244,7 +271,7 @@ function pickVoice(): SpeechSynthesisVoice | null {
  *  always naming a speechSynthesis voice that a cloud or neural engine has
  *  quietly replaced. */
 export function currentVoiceName(): string {
-  if (USE_ELEVENLABS || caps().tts) return 'ElevenLabs'
+  if (USE_ELEVENLABS || caps().tts) return ttsProviderLabel()
   if (TTS_ENGINE === 'kokoro' && !kokoro.isUnavailable()) {
     return KOKORO_VOICE.replace(/^bm_/, '')
   }
@@ -262,6 +289,23 @@ export function cycleVoice(): string {
   localStorage.setItem(VOICE_PREF_KEY, next.name)
   cachedVoice = next
   return next.name
+}
+
+/** English voices this machine has, for the Settings page's picker. */
+export function englishVoices(): SpeechSynthesisVoice[] {
+  return speechSynthesis.getVoices().filter((v) => /^en/i.test(v.lang))
+}
+
+/** The voice chosen in Settings, or null when the best match is picked automatically. */
+export function chosenVoice(): string | null {
+  return localStorage.getItem(VOICE_PREF_KEY)
+}
+
+/** Choose a voice by name, or null to go back to the automatic pick. */
+export function chooseVoice(name: string | null) {
+  if (name) localStorage.setItem(VOICE_PREF_KEY, name)
+  else localStorage.removeItem(VOICE_PREF_KEY)
+  cachedVoice = undefined
 }
 
 // Voices load asynchronously in Chrome; the first call usually returns nothing.
@@ -359,14 +403,14 @@ export function createSpeaker(): Speaker {
     const text = shape(sentence)
     if (!text) return
 
-    const item: Item = { text }
+    const items: Item[] = pieces(text).map((t) => ({ text: t }))
     if (priority) {
       // Genuinely ahead of the queue this time. The old `say()` appended to the
       // same chain and only appeared to preempt because it was called when the
       // queue happened to be empty.
-      queue.unshift(item)
+      queue.unshift(...items)
     } else {
-      queue.push(item)
+      queue.push(...items)
     }
     void pump()
   }
@@ -438,6 +482,14 @@ export function createSpeaker(): Speaker {
       const spoke = await speakNative(item.text)
       if (spoke || cancelled) return
 
+      // With no cloud voice to fall back to, latching the system voice off
+      // would only put a failing round trip in front of every later sentence.
+      // A slow online voice is usually a network hiccup: give it one more go.
+      if (!caps().tts) {
+        await speakNative(item.text)
+        return
+      }
+
       // The OS voice produced no sound. That is not recoverable by retrying it,
       // so latch it off and rescue this sentence through the bridge's speech
       // proxy — which already holds an ElevenLabs key borrowed from the MCP
@@ -504,14 +556,11 @@ export function createSpeaker(): Speaker {
       let done = false
       let started = false
       let watchdog: ReturnType<typeof setTimeout> | null = null
-      let keepalive: ReturnType<typeof setInterval> | null = null
-
       const finish = () => {
         if (done) return
         done = true
         nativeInFlight = false
         if (watchdog) clearTimeout(watchdog)
-        if (keepalive) clearInterval(keepalive)
         cancelAnimationFrame(raf)
         // Held rather than zeroed, so the orb doesn't collapse in the gap
         // between two sentences of the same answer.
@@ -525,14 +574,9 @@ export function createSpeaker(): Speaker {
         diag.started++
         diag.lastError = ''
         if (watchdog) clearTimeout(watchdog)
-        // Chrome stops speaking after roughly fifteen seconds unless the engine
-        // is nudged. A pause/resume pair is the standard keepalive and is
-        // inaudible; without it long answers cut off mid-sentence.
-        keepalive = setInterval(() => {
-          if (done) return
-          speechSynthesis.pause()
-          speechSynthesis.resume()
-        }, 5000)
+        // No pause()/resume() "keepalive": measured on Windows Chrome, a
+        // 30-second sentence finishes without one on both Google and Microsoft
+        // voices, while the nudge froze the Microsoft voices partway through.
       }
       u.onend = finish
       // Swallowing this was a mistake. When the OS voice fails there is no
@@ -555,6 +599,12 @@ export function createSpeaker(): Speaker {
       // nothing else will ever tell us — no error fires. Un-wedge and try once
       // more; if that also goes nowhere, resolve rather than hang, because a
       // silent sentence is recoverable and a stuck queue is not.
+      // An online voice (Google's) fetches its audio first; measured, a long
+      // piece regularly took over two seconds to start, and the local-voice
+      // deadline cancelled it — the sentence was skipped.
+      const online = voice ? !voice.localService : false
+      const firstWait = online ? 3500 : 700
+      const retryWait = online ? 3500 : 1500
       watchdog = setTimeout(() => {
         if (done || started) return
         console.warn('[jarvis] speech did not start — un-wedging the engine')
@@ -572,8 +622,8 @@ export function createSpeaker(): Speaker {
           diag.failures++
           diag.lastError = diag.lastError || 'no-start'
           finish()
-        }, 1500)
-      }, 700)
+        }, retryWait)
+      }, firstWait)
       diag.spoken++
       diag.lastText = text.slice(0, 60)
       diag.voice = u.voice?.name ?? 'default'
@@ -736,49 +786,18 @@ export function createSpeaker(): Speaker {
   }
 }
 
-/** Only used when USE_ELEVENLABS is on. Bridge proxy first (it already holds
- *  the key), then a direct key, then null to fall back to the native voice. */
+/** The bridge's voice (it holds any speech key), or null to fall back to the
+ *  native voice. The browser never calls a speech API with a key of its own. */
 async function fetchCloudAudio(text: string): Promise<string | null> {
-  if (BACKEND === 'bridge') {
-    try {
-      const res = await fetch(`${BRIDGE_HTTP_URL}/tts`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ text }),
-      })
-      if (res.ok) return URL.createObjectURL(await res.blob())
-    } catch {
-      /* fall through */
-    }
+  try {
+    const res = await fetch(`${BRIDGE_HTTP_URL}/tts`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ text }),
+    })
+    if (res.ok) return URL.createObjectURL(await res.blob())
+  } catch {
+    /* fall through */
   }
-
-  if (env.elevenKey) {
-    try {
-      const res = await fetch(
-        `https://api.elevenlabs.io/v1/text-to-speech/${env.elevenVoiceId}/stream` +
-          `?output_format=mp3_22050_32&optimize_streaming_latency=3`,
-        {
-          method: 'POST',
-          headers: {
-            'xi-api-key': env.elevenKey,
-            'content-type': 'application/json',
-          },
-          body: JSON.stringify({
-            text,
-            model_id: 'eleven_flash_v2_5',
-            voice_settings: {
-              stability: 0.4,
-              similarity_boost: 0.75,
-              speed: 1.05,
-            },
-          }),
-        },
-      )
-      if (res.ok) return URL.createObjectURL(await res.blob())
-    } catch {
-      /* fall through */
-    }
-  }
-
   return null
 }

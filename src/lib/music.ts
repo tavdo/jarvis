@@ -79,8 +79,16 @@ let ducked = false
 /** How far the bed drops under the voice. */
 const DUCK = 0.35
 
+/** Switched off in Settings: no cue starts, and anything playing fades out. */
+let allowed = true
+
+export function allow(on: boolean) {
+  allowed = on
+  if (!on) stopAll()
+}
+
 function track(cue: Cue): Track | null {
-  if (!enabled || missing.has(cue)) return null
+  if (!enabled || !allowed || missing.has(cue)) return null
   let t = tracks.get(cue)
   if (!t) {
     const el = new Audio(`/audio/${cue}.mp3`)

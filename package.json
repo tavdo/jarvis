@@ -2,11 +2,11 @@
   "name": "jarvis",
   "private": true,
   "version": "0.0.0",
-  "description": "A browser voice assistant with an Iron Man holographic interface, driven by Claude Code through a small Node bridge.",
+  "description": "A browser voice assistant with an Iron Man holographic interface, driven by OpenAI or Gemini through a small Node bridge.",
   "license": "MIT",
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": ">=20.12"
   },
   "scripts": {
     "start": "node scripts/start.mjs",
@@ -15,12 +15,11 @@
     "lint": "oxlint",
     "preview": "vite preview",
     "bridge": "node bridge/server.mjs",
-    "bridge:writes": "JARVIS_ALLOW_WRITES=1 node bridge/server.mjs",
-    "setup": "node scripts/setup.mjs"
+    "setup": "node scripts/setup.mjs",
+    "desktop": "node scripts/desktop.mjs",
+    "desktop:install": "node scripts/desktop-install.mjs"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.3.220",
-    "@anthropic-ai/sdk": "^0.115.0",
     "@mediapipe/tasks-vision": "^1.0.1",
     "@picovoice/porcupine-web": "^4.0.1",
     "@picovoice/web-voice-processor": "^4.0.10",
@@ -30,6 +29,7 @@
     "dompurify": "^3.4.12",
     "framer-motion": "^12.43.0",
     "kokoro-js": "^1.2.1",
+    "openai": "^7.30.1",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "three": "^0.185.1",

@@ -1,20 +1,27 @@
-import type { AskHandlers } from './anthropic'
+import { create } from 'zustand'
 import type { Blade, Panel } from '../store'
-import { BRIDGE_WS_URL } from '../config'
+import { BRIDGE_HTTP_URL, BRIDGE_WS_URL } from '../config'
+import { onSession, sessionToken } from './lock'
 
 /**
  * Client for the local bridge (see bridge/server.mjs).
  *
- * Same `ask()` shape as the browser-direct path, so App.tsx doesn't care which
- * brain is behind it. The difference is what's reachable: this one runs on your
- * machine, so every MCP server in your Claude Code config is in play.
+ * The bridge holds the AI provider, the API keys and the tools; this page only
+ * ever sends what was said and receives what to say and show. No credential is
+ * ever sent to, or read by, the browser.
  *
- * The socket is the session. The bridge holds one Claude Agent SDK query per
- * connection and the whole conversation lives inside it, so a dropped socket
- * silently wipes JARVIS's memory of the exchange while the transcript on screen
- * still shows it. That is why the reconnect below is loud rather than
- * invisible: `watchConnection` exists so the HUD can say so.
+ * The socket is the session. The bridge keeps one conversation per connection,
+ * so a dropped socket wipes JARVIS's memory of the exchange while the
+ * transcript on screen still shows it. That is why the reconnect below is loud
+ * rather than invisible: `watchConnection` exists so the HUD can say so.
  */
+
+export type AskHandlers = {
+  /** Fires for each chunk of the spoken answer. */
+  onText: (delta: string) => void
+  /** Fires when a tool starts running. */
+  onTool: (name: string) => void
+}
 
 /** Anything the bridge sends. Deliberately loose — a frame from a future
  *  bridge build should be ignored, not crash the turn. */
@@ -34,8 +41,21 @@ type Frame = {
   mode?: string
   seconds?: number
   when?: string
+  action?: string
+  detail?: string
+  tool?: string
+  timeoutMs?: number
   servers?: Array<string | { name?: string }>
+  tools?: ToolGroup[]
+  kind?: string
+  say?: string
 }
+
+/** The bridge's tools as the Tools page lists them. */
+export type ToolGroup = { group: string; tools: { name: string; summary: string; asks: boolean }[] }
+
+/** Announced with `ready`; replaced on every reconnect, since settings can change the set. */
+export const useToolCatalog = create<{ groups: ToolGroup[] }>(() => ({ groups: [] }))
 
 /** Every question gets an id so its answer can be told from anyone else's. */
 let askSeq = 0
@@ -83,6 +103,30 @@ export function watchCapture(fn: (req: CaptureRequest) => Promise<CaptureResult>
   onCapture = fn
 }
 
+/**
+ * The bridge asking the user to approve something that changes the world — a
+ * click on a web page, a file going to the recycle bin. The handler shows it
+ * and resolves with the user's answer. `cancel` fires if the bridge withdraws
+ * the question (timeout, interruption), so the prompt can be taken down.
+ */
+export type ConfirmRequest = {
+  id: string
+  action: string
+  detail: string
+  tool: string
+  timeoutMs: number
+}
+
+let onConfirm: ((req: ConfirmRequest) => Promise<boolean>) | null = null
+let onConfirmCancel: ((id: string) => void) | null = null
+export function watchConfirm(
+  fn: (req: ConfirmRequest) => Promise<boolean>,
+  cancel: (id: string) => void,
+) {
+  onConfirm = fn
+  onConfirmCancel = cancel
+}
+
 /** Blades arrive the same way panels do — pushed mid-turn, so the article is
  *  already open as he starts the sentence about it. */
 let onBlade: ((blade: Blade) => void) | null = null
@@ -98,6 +142,13 @@ export function watchBlades(fn: (blade: Blade) => void) {
 let onUi: ((op: string, args: any) => void) | null = null
 export function watchUi(fn: (op: string, args: any) => void) {
   onUi = fn
+}
+
+/** The bridge owns reminders and pushes one here when it falls due, turn or no turn. */
+export type ReminderDue = { id: string; kind: string; text: string; say: string }
+let onReminder: ((r: ReminderDue) => void) | null = null
+export function watchReminders(fn: (r: ReminderDue) => void) {
+  onReminder = fn
 }
 
 /**
@@ -169,13 +220,13 @@ function dispatch(ws: WebSocket) {
     }
 
     if (msg.type === 'ready') {
-      // The bridge announces immediately on connect from Claude Code's config,
-      // then again with live status once the agent initialises. Keep listening
-      // so the later, more accurate list wins.
+      // The bridge announces its model and tool groups on connect. Keep
+      // listening so a later announcement, if any, wins.
       servers = (msg.servers ?? [])
         .map((s) => (typeof s === 'string' ? s : (s.name ?? '')))
         .filter(Boolean)
       onServers?.(servers)
+      if (Array.isArray(msg.tools)) useToolCatalog.setState({ groups: msg.tools })
       firstReady.resolve()
     } else if (msg.type === 'panel' && msg.panel) {
       onPanel?.(msg.panel)
@@ -203,13 +254,42 @@ function dispatch(ws: WebSocket) {
           .then(reply)
           .catch((err) => reply({ error: String(err?.message ?? err) }))
       }
+    } else if (msg.type === 'confirm' && msg.id) {
+      const id = msg.id
+      const reply = (approved: boolean) => {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'reply', id, approved }))
+        }
+      }
+      // No handler, or a handler that fails, is a no. Never a yes by default.
+      if (!onConfirm) {
+        reply(false)
+      } else {
+        onConfirm({
+          id,
+          action: msg.action ?? 'Allow this action?',
+          detail: msg.detail ?? '',
+          tool: msg.tool ?? '',
+          timeoutMs: Number(msg.timeoutMs) || 30_000,
+        })
+          .then((approved) => reply(approved === true))
+          .catch(() => reply(false))
+      }
+    } else if (msg.type === 'confirm_cancel' && msg.id) {
+      onConfirmCancel?.(msg.id)
     } else if (msg.type === 'ui' && msg.op) {
       // A `ui` frame with no args is normal — reset and clear take none — so an
       // absent args object is an empty one, not a reason to drop the command.
       onUi?.(msg.op, (msg.args ?? {}) as Record<string, unknown>)
+    } else if (msg.type === 'reminder' && msg.id && typeof msg.say === 'string') {
+      onReminder?.({ id: msg.id, kind: msg.kind ?? 'reminder', text: msg.text ?? '', say: msg.say.slice(0, 500) })
     }
   })
 }
+
+onSession((token) => {
+  if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'unlock', token }))
+})
 
 function connect(): Promise<WebSocket> {
   if (socket?.readyState === WebSocket.OPEN) return Promise.resolve(socket)
@@ -244,6 +324,10 @@ function connect(): Promise<WebSocket> {
     ws.onopen = () => {
       socket = ws
       attempt = 0
+      // First, before any question: a reconnected socket is a new session on
+      // the bridge's side, and would refuse to answer without this.
+      const token = sessionToken()
+      if (token) ws.send(JSON.stringify({ type: 'unlock', token }))
       dispatch(ws)
       settle(null)
       onConnection?.(everConnected ? 'reconnected' : 'open')
@@ -296,6 +380,31 @@ export async function warmBridge(): Promise<void> {
     firstReady.promise,
     new Promise<void>((resolve) => setTimeout(resolve, 2500)),
   ])
+  await checkBrain()
+}
+
+/**
+ * Ask the bridge whether its AI provider is usable, so a missing or rejected
+ * API key is on screen at boot rather than after the first question. Only a
+ * message comes back — the bridge never sends any part of a key.
+ */
+async function checkBrain(): Promise<void> {
+  type Health = { ai?: { ready?: boolean; checked?: boolean; error?: string | null } }
+  let health: Health | null = null
+  // The key check runs asynchronously at bridge start; give it a moment.
+  for (let i = 0; i < 6; i++) {
+    try {
+      const res = await fetch(`${BRIDGE_HTTP_URL}/health`, { signal: AbortSignal.timeout(3000) })
+      if (res.ok) health = (await res.json()) as Health
+    } catch {
+      return // the socket is up; a failed probe is not worth blocking boot over
+    }
+    if (!health?.ai || health.ai.checked) break
+    await new Promise((r) => setTimeout(r, 500))
+  }
+  if (health?.ai && health.ai.checked && !health.ai.ready && health.ai.error) {
+    throw new Error(health.ai.error)
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -495,7 +604,8 @@ export function interrupt(): void {
   cancel()
 }
 
-/** `mcp__higgsfield__generate_image` -> `higgsfield · generate image` */
+/** `mcp__higgsfield__generate_image` -> `higgsfield · generate image`. The
+ *  bridge already sends the pretty form; other names pass through. */
 function prettyToolName(raw: string): string {
   if (!raw.startsWith('mcp__')) return raw
   const [, server, ...rest] = raw.split('__')

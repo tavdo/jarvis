@@ -6,8 +6,9 @@
  * both as children, tags their output so you can tell them apart, and shuts
  * them down together on Ctrl-C — no extra dependency, just Node.
  *
- * Pass --writes to allow JARVIS to take real actions (drive the phone, the
- * browser, send things): `npm start -- --writes`.
+ * There is no "allow everything" switch: actions that change something (a
+ * click on a web page, a file to the recycle bin) ask for confirmation in the
+ * interface every time.
  */
 
 import { spawn } from 'node:child_process'
@@ -44,8 +45,6 @@ function vendorWasm() {
   }
 }
 
-const writes = process.argv.includes('--writes')
-
 // A dim label per process, so the interleaved logs stay readable.
 const paint = (tag, colour) => (line) =>
   line
@@ -57,6 +56,9 @@ const paint = (tag, colour) => (line) =>
 
 const children = []
 
+/** The bridge exits with this after saving settings, asking to be started again. */
+const RESTART_CODE = 75
+
 function run(name, command, args, colour, env) {
   const label = paint(name, colour)
   const child = spawn(command, args, {
@@ -66,6 +68,12 @@ function run(name, command, args, colour, env) {
   child.stdout.on('data', (d) => process.stdout.write(label(d) + '\n'))
   child.stderr.on('data', (d) => process.stderr.write(label(d) + '\n'))
   child.on('exit', (code) => {
+    if (code === RESTART_CODE && !stopping) {
+      console.log(`\x1b[${colour}m${name}\x1b[0m restarting with the new settings.`)
+      children.splice(children.indexOf(child), 1)
+      run(name, command, args, colour, env)
+      return
+    }
     // If either half dies the other is useless, so take the whole thing down
     // rather than leave a half-running app that looks alive but cannot answer.
     console.log(`\x1b[${colour}m${name}\x1b[0m exited (${code}); stopping the rest.`)
@@ -97,7 +105,7 @@ process.on('SIGTERM', () => shutdown(0))
  *
  * The bridge only trusts WebSocket origins on localhost:5173-5199 and
  * 4173-4199, which is the right default — a socket that any local page can open
- * is a socket that drives every MCP server on the machine. But a launcher that
+ * is a socket that drives every tool on the machine. But a launcher that
  * assigns a port outside that range produces the single most confusing failure
  * this project has: the interface loads, the reactor spins, the microphone
  * hears you, and the brain answers nothing, because the handshake is being 403'd
@@ -105,7 +113,7 @@ process.on('SIGTERM', () => shutdown(0))
  * without widening what the bridge trusts by default.
  */
 const port = process.env.PORT
-const bridgeEnv = writes ? { JARVIS_ALLOW_WRITES: '1' } : {}
+const bridgeEnv = { JARVIS_SUPERVISED: '1' }
 if (port) {
   bridgeEnv.JARVIS_ALLOWED_ORIGINS = `http://localhost:${port},http://127.0.0.1:${port}`
   console.log(`  serving the face on port ${port}; the bridge will accept it.\n`)

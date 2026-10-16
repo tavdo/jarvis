@@ -1,3 +1,5 @@
+import { prefsNow } from './prefs'
+
 /**
  * A single shared microphone stream plus an analyser, so the reactor can pulse
  * with the user's voice. Opening the mic more than once causes Chrome to drop
@@ -15,7 +17,10 @@ export async function getMic(): Promise<MediaStream> {
     audio: {
       echoCancellation: true,
       noiseSuppression: true,
-      autoGainControl: true,
+      // Gain control lifts whatever it hears towards one level, so after a few
+      // seconds of television the television is as loud as the user — which
+      // is the one difference the voice-focus filter reads. Fixed at start-up.
+      autoGainControl: !prefsNow().voiceFocus,
     },
   })
   return stream

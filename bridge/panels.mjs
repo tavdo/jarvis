@@ -1,4 +1,4 @@
-import { createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk'
+import { tool, toolGroup } from './tools/registry.mjs'
 import { z } from 'zod'
 import { probeUrl } from './page.mjs'
 
@@ -14,8 +14,8 @@ import { probeUrl } from './page.mjs'
  * What's fixed is the design system below, so everything it builds still looks
  * like one interface. The browser sanitises the markup before it renders.
  *
- * It runs in-process (an SDK MCP server, not a subprocess), so the handler
- * pushes straight down the open WebSocket — no round trip, no temp file.
+ * It runs in-process, so the handler pushes straight down the open WebSocket —
+ * no round trip, no temp file.
  */
 
 const DESIGN_SYSTEM = `
@@ -318,15 +318,12 @@ argument. You know those things. Overrule it whenever you have reason to.`
  * @param {(blade: object) => void} emitBlade - pushes a blade to the browser
  */
 export function displayServer(emit, emitBlade) {
-  return createSdkMcpServer({
+  return toolGroup({
     name: 'jarvis',
-    version: '1.0.0',
+    label: 'display',
     instructions:
       'The JARVIS heads-up display. Use `display` to put content on screen ' +
       'alongside what you say.',
-    // Never defer this behind tool search — if the model has to go looking for
-    // it, it won't occur to it to show anything.
-    alwaysLoad: true,
     tools: [
       tool('display', DESCRIPTION, schema, async (args) => {
         // Refuse rather than warn. Emitting anyway put a blank card on screen
@@ -375,7 +372,7 @@ export function displayServer(emit, emitBlade) {
           hold: args.hold ?? 'turn',
         })
         return { content: [{ type: 'text', text: 'On screen.' }] }
-      }),
+      }, { quiet: true }),
 
       tool('blade', BLADE_DESCRIPTION, bladeSchema, async (args) => {
         const kind = args.kind

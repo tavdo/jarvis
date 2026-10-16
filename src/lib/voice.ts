@@ -3,6 +3,7 @@ import { getMic } from './audio'
 import { speakingNow, speakingSince } from './tts'
 import { startVad, type Vad } from './vad'
 import { caps } from './capabilities'
+import { prefsNow } from './prefs'
 
 /**
  * The voice loop.
@@ -47,6 +48,9 @@ export type VoiceHandlers = {
   onPartial: (text: string) => void
   /** A complete, endpointed utterance. */
   onUtterance: (text: string) => void
+  /** A confirmation is waiting on a spoken yes or no. Speech is the answer
+   *  then, so it is never filtered down to stop words. */
+  answering: () => boolean
   /** The recogniser is unusable. Distinct from the user saying nothing. */
   onError: (message: string) => void
 }
@@ -65,6 +69,15 @@ export type Voice = {
 const WAKE_DEBOUNCE = 1500
 
 /**
+ * A letter or digit in any script. JavaScript's \b only knows A–Z, so it
+ * never finds the edge of a Georgian word; these lookarounds do.
+ */
+const LETTER = '[\\p{L}\\p{N}_]'
+
+/** His name as a Georgian recogniser writes it: ჯარვის, ჯარვისი, ჯარვისო, ჯერვის. */
+export const NAME_KA = 'ჯ[აე]რვის[იო]?'
+
+/**
  * His name, and the only wake phrase.
  *
  * The optional prefix is genuinely optional: addressing him by name alone is
@@ -77,8 +90,111 @@ const WAKE_DEBOUNCE = 1500
  * used to be silently discarded, so the wake word "just didn't work" with no
  * indication why. Better a rare false wake than a name that does not answer.
  */
-const WAKE =
-  /\b(?:hey|hi|ok|okay|yo)?\s*(?:jarvis|jarvys|jervis|jarvis's|travis|jarviss|java's|jarv)\b(?!'s)/i
+const WAKE = new RegExp(
+  `(?<!${LETTER})(?:(?:hey|hi|ok|okay|yo|ჰეი)\\s*)?(?:jarvis|jarvys|jervis|jarvis's|travis|jarviss|java's|jarv|${NAME_KA})(?!${LETTER})(?!'s)`,
+  'iu',
+)
+
+/** His name and its usual mishearings, as one alternation. */
+const NAME_WORDS = `jarvis|jarvys|jervis|travis|jarviss|java's|jarv|${NAME_KA}`
+
+/**
+ * What cuts him off while he is talking, when only words may (the default).
+ *
+ * Narrower than OVERRIDE on purpose. "No" and "wait" turn up in every
+ * conversation on a television, and the point of the setting is that the
+ * television cannot stop him: only "stop", its few plain synonyms, or his name.
+ *
+ * A lone "გაჩერდი" loses or changes its first sound more often than not —
+ * "აჩერდი", "მაჩერდი" — because the recorder starts a moment after the word
+ * does, so it is matched on "ჩერდი". In English mode, where the transcriber
+ * guesses the language per clip, it comes back as "Açerdi", "gacherdi" or
+ * "Acher de" — and sometimes as something no pattern could catch, which is
+ * why "stop" and his name are the reliable words there.
+ */
+const HALT = new RegExp(
+  `(?<![\\p{L}\\p{N}_-])(?:stop|enough|cancel|quiet|shut up|სტოპ|[ა-ჰ]{0,2}ჩერდი(?:თ)?|კმარა|შეწყვიტე|გაჩუმდი|გააუქმე|` +
+    `(?:g?a)?[cçč]h?er ?d[ei]|kmara|${NAME_WORDS})(?!${LETTER})`,
+  'iu',
+)
+const HALT_ALL = new RegExp(HALT.source, 'giu')
+
+/** The stop-words-only rule is on, and nothing is waiting on a yes or no. */
+const wordsOnly = (h: VoiceHandlers) => prefsNow().stopWordsOnly && !h.answering()
+
+/**
+ * Scribe describes the sounds it hears as well as the words: "(music)",
+ * "[applause]", "(TV playing)". Those are the room, not the user, and taken as
+ * speech they were the "questions" he answered when nobody had said anything.
+ */
+function wordsIn(text: string): string {
+  return text
+    .replace(/\([^)]*\)|\[[^\]]*\]|\*[^*]*\*|[♪♫]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+/** A hum or a breath transcribed — never a request on its own. */
+const FILLER = /^(?:u+h+|u+m+|h?m+|hm+|a+h+|o+h+|e+h+|e+r+)[\s.,!?…-]*$/i
+
+// ---------------------------------------------------------------------------
+// Only the user's voice
+// ---------------------------------------------------------------------------
+
+/**
+ * How loud the user is, learned from the segments that carried his name.
+ *
+ * There is no voiceprint here — a browser has nothing that can tell two people
+ * apart reliably — but distance does most of the same work. The user is the
+ * one sitting at the microphone; a television, music or the people in the next
+ * room arrive many decibels quieter. Every time his name is heard the level of
+ * that segment is recorded, and anything far below the user's usual level is
+ * dropped before it is even sent for transcription.
+ *
+ * Only name-bearing segments teach it. Those are the ones that are certainly
+ * the user; learning from every accepted command would let a loud television
+ * drag the profile down until it let itself in.
+ */
+const PROFILE_KEY = 'jarvis.voiceLevel'
+const PROFILE_SIZE = 12
+/** Below this share of the user's level a segment is someone else. Lenient
+ *  for the wake word, so standing up and calling him from across the room still works. */
+const FAINT: Record<'wake' | 'command' | 'guard', number> = { wake: 0.2, command: 0.35, guard: 0.35 }
+
+let profile: number[] = (() => {
+  try {
+    const saved = JSON.parse(localStorage.getItem(PROFILE_KEY) ?? '[]')
+    return Array.isArray(saved)
+      ? saved.filter((n) => typeof n === 'number' && n > 0 && n < 1).slice(-PROFILE_SIZE)
+      : []
+  } catch {
+    return []
+  }
+})()
+
+/** The median, so one shout or one mumble does not move it. 0 = not learned yet. */
+function yourLevel(): number {
+  if (!profile.length) return 0
+  const sorted = [...profile].sort((a, b) => a - b)
+  return sorted[Math.floor(sorted.length / 2)]
+}
+
+function learnVoice(level: number) {
+  if (!prefsNow().voiceFocus || !(level > 0)) return
+  profile = [...profile, level].slice(-PROFILE_SIZE)
+  diag.voiceLevel = yourLevel()
+  try {
+    localStorage.setItem(PROFILE_KEY, JSON.stringify(profile))
+  } catch {
+    /* storage blocked — it still works for this session */
+  }
+}
+
+function tooFaint(level: number, mode: VoiceMode): boolean {
+  if (!prefsNow().voiceFocus || mode === 'deaf') return false
+  const mine = yourLevel()
+  return mine > 0 && level < mine * FAINT[mode]
+}
 
 /** Everything after the wake phrase, which is usually the actual command. */
 function afterWake(text: string): string {
@@ -257,17 +373,47 @@ function makeAssembler(h: {
 const norm = (s: string) =>
   s
     .toLowerCase()
-    .replace(/[^a-z0-9' ]+/g, ' ')
+    .replace(/[^\p{L}\p{N}' ]+/gu, ' ')
+    .replace(/(\d)(\p{L})/gu, '$1 $2')
+    .replace(/(\p{L})(\d)/gu, '$1 $2')
     .replace(/\s+/g, ' ')
     .trim()
+
+const NUMBER_WORDS = new Set(
+  ('zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen ' +
+    'seventeen eighteen nineteen twenty thirty forty fifty sixty seventy eighty ninety hundred thousand ' +
+    'million billion point half quarter').split(' '),
+)
+const UNITS: Record<string, string> = {
+  gigabyte: 'gb', gigabytes: 'gb', gig: 'gb', gigs: 'gb',
+  megabyte: 'mb', megabytes: 'mb', terabyte: 'tb', terabytes: 'tb',
+  kilobyte: 'kb', kilobytes: 'kb', percent: 'pct', per: 'pct', cent: 'pct',
+  degrees: 'deg', degree: 'deg', celsius: 'c', kilometres: 'km', kilometers: 'km',
+}
+
+/**
+ * One spelling per word for echo matching. The recogniser writes what he says
+ * as "sixteen gigabytes" back as "16 GB", so every number becomes '#' and units
+ * their abbreviation — otherwise each figure in an answer reads as the user
+ * talking over him.
+ */
+function canon(word: string): string {
+  if (/^\d+$/.test(word) || NUMBER_WORDS.has(word)) return '#'
+  return UNITS[word] ?? word
+}
+
+const wordsOf = (s: string) => norm(s).split(' ').filter(Boolean).map(canon)
 
 /**
  * Short words that must always cut through, even when they collide with what
  * he happens to be saying. Suppressing "stop" because he just said "stop"
  * would be the single most infuriating failure this file could have.
  */
-const OVERRIDE =
-  /\b(stop|wait|jarvis|cancel|enough|quiet|hold on|shut up|never ?mind|forget it|no)\b/i
+const OVERRIDE = new RegExp(
+  `(?<!${LETTER})(?:stop|wait|jarvis|cancel|enough|quiet|hold on|shut up|never ?mind|forget it|no|` +
+    `გაჩერდი|მოიცადე|კმარა|შეწყვიტე|გაჩუმდი|არა|სტოპ|${NAME_KA})(?!${LETTER})`,
+  'iu',
+)
 
 /**
  * Words too common to be evidence of anything.
@@ -284,7 +430,10 @@ const STOP = new Set(
     'our their what which who how why when where do does did can could would ' +
     'should will shall not no yes if then than as about into over under out up ' +
     'down one two three first second third now here there just very really got ' +
-    'get have has had say said tell me okay ok well right').split(' '),
+    'get have has had say said tell me okay ok well right ' +
+    'და თუ რომ არ ეს ის ეგ მე შენ ჩვენ თქვენ რა რას როგორ რატომ როდის სად ვინ კი ხომ ' +
+    'უკვე ახლა აქ იქ ან მაგრამ არის იყო ვარ ხარ ჩემი შენი ერთი ორი სამი ძალიან ' +
+    'კარგი დიახ ჰო ხო ბატონო').split(' '),
 )
 
 /**
@@ -296,12 +445,12 @@ const STOP = new Set(
  */
 function isEcho(heard: string, spoken: string): boolean {
   if (!spoken) return false
-  if (OVERRIDE.test(heard)) return false
+  if (overrides(heard, spoken)) return false
 
-  const all = norm(heard).split(' ').filter(Boolean)
+  const all = wordsOf(heard)
   if (!all.length) return true
 
-  const mine = new Set(norm(spoken).split(' '))
+  const mine = new Set(wordsOf(spoken))
   const content = all.filter((w) => !STOP.has(w))
 
   // Nothing distinctive was said at all, so there is no strong evidence either
@@ -309,12 +458,82 @@ function isEcho(heard: string, spoken: string): boolean {
   // real question is much higher than the cost of one stray echo getting in.
   if (content.length < 2) {
     if (all.length < 2) return false
-    return all.every((w) => mine.has(w))
+    return all.every((w) => saidBy(w, mine))
   }
 
   let hits = 0
-  for (const w of content) if (mine.has(w)) hits++
+  for (const w of content) if (saidBy(w, mine)) hits++
   return hits / content.length >= 0.6
+}
+
+/**
+ * How many of these words he is not saying. Used while he talks: the browser
+ * recogniser hears every word of his through the speakers, a long sentence
+ * comes back as dozens of fragments, and one misheard word in a two-word
+ * fragment used to be enough to cut him off. A real interruption brings at
+ * least two words of its own; "stop", "wait" and his name need none. Function
+ * words do not count: the recogniser splits his "about" into "a bad".
+ */
+function foreignWords(heard: string, spoken: string): number {
+  const mine = new Set(wordsOf(spoken))
+  return wordsOf(heard).filter((w) => !STOP.has(w) && !saidBy(w, mine)).length
+}
+
+const OVERRIDE_ALL = new RegExp(OVERRIDE.source, 'giu')
+
+/**
+ * An override word from the user, rather than one of his own words coming
+ * back through the speakers.
+ *
+ * A word he is not saying always cuts through, at any length. A word he *is*
+ * saying only counts when it arrives bare — "stop", "no, wait" — because that
+ * is the stop button; arriving with the rest of his sentence ("there is no
+ * need"), it is his echo, and treating it as a command cut long answers off
+ * mid-sentence.
+ */
+function overrides(heard: string, spoken: string, one = OVERRIDE, all = OVERRIDE_ALL): boolean {
+  if (!one.test(heard)) return false
+  const mine = ` ${norm(spoken)} `
+  const found = [...heard.matchAll(all)].map((m) => norm(m[0]))
+  if (found.some((w) => !mine.includes(` ${w} `))) return true
+  const rest = norm(heard.replace(all, ' ')).split(' ').filter(Boolean)
+  return rest.length === 0
+}
+
+/** "Stop" or his name from the user — the same echo rule as `overrides`. */
+const halts = (heard: string, spoken: string) => overrides(heard, spoken, HALT, HALT_ALL)
+
+/** Edit distance within `max`, bailing out as soon as it can't be. */
+function near(a: string, b: string, max: number): boolean {
+  if (Math.abs(a.length - b.length) > max) return false
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j)
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i]
+    let best = i
+    for (let j = 1; j <= b.length; j++) {
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1))
+      best = Math.min(best, cur[j])
+    }
+    if (best > max) return false
+    prev = cur
+  }
+  return prev[b.length] <= max
+}
+
+/**
+ * Is this one of his words? The recogniser mangles its own playback — "bytes"
+ * comes back as "bites", "gigabytes" as "giga" — and on a long sentence one
+ * mangled word was enough to read the echo as an interruption. A near miss
+ * on a word of four letters or more counts.
+ */
+function saidBy(word: string, mine: Set<string>): boolean {
+  if (mine.has(word)) return true
+  if (word.length < 4) return false
+  const max = word.length >= 7 ? 2 : 1
+  for (const s of mine) {
+    if (s.length >= 4 && (s.startsWith(word) || s.endsWith(word) || near(word, s, max))) return true
+  }
+  return false
 }
 
 // ---------------------------------------------------------------------------
@@ -340,6 +559,8 @@ export const diag = {
   sessions: 0,
   /** The most recent transcript, whatever the mode. */
   heard: '',
+  /** What the browser recogniser has right now, before it is final. */
+  partial: '',
   heardAt: 0,
   /** Last failure — a transcription error, or a capture error. */
   lastError: '',
@@ -357,10 +578,20 @@ export const diag = {
   waitedMs: 0,
   /** Barge-ins suppressed because he had only just started the sentence. */
   selfGuarded: 0,
+  /** What was heard when the last barge-in cut him off, and what he was saying. */
+  bargedOn: '',
+  bargedOver: '',
   /** Transcription failures (network, or the bridge speech proxy). */
   restarts: 0,
   /** Milliseconds the last transcription round-trip took. */
   idleMs: 0,
+  /** The user's learned speaking level (0 = not learned yet), and the last segment's. */
+  voiceLevel: yourLevel(),
+  segmentLevel: 0,
+  /** Segments dropped as too quiet to be the user. */
+  faint: 0,
+  /** Speech ignored while he talked, because it was not "stop" or his name. */
+  ignored: 0,
 }
 
 /** Record why a transcript went nowhere. Silence always has a reason; this is
@@ -402,6 +633,14 @@ export async function startVoice(h: VoiceHandlers): Promise<Voice> {
   return caps().stt ? startElevenVoice(h) : startBrowserVoice(h)
 }
 
+/** One captured stretch of speech, waiting for the transcriber. */
+type Segment = {
+  blob: Blob
+  /** Captured while he talked under the stop-words-only rule. */
+  guarded: boolean
+  loudness: number
+}
+
 /** VAD + ElevenLabs Scribe. */
 async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
   let lastWake = 0
@@ -420,8 +659,16 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
    * Order is preserved because the drain is single-flight, which matters —
    * "London" arriving before "what's the weather in" is worse than either.
    */
-  const pendingAudio: Blob[] = []
+  const pendingAudio: Segment[] = []
   let draining = false
+  /**
+   * The segment being captured started while he was talking, under the
+   * stop-words-only rule. Decided at the start rather than when the words come
+   * back: he has often finished his sentence by then, and a television heard
+   * over him must not turn into a question the moment he stops.
+   */
+  let capturingGuarded = false
+  let capturingMode: VoiceMode = 'wake'
 
   /**
    * Transcripts become turns here rather than one-per-segment.
@@ -445,7 +692,7 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
    * transcript arriving — and the transcript belongs to the mode the user is in
    * now, not the one they interrupted.
    */
-  const transcribe = async (blob: Blob) => {
+  const transcribe = async ({ blob, guarded, loudness }: Segment) => {
     const mode = h.mode()
     if (mode === 'deaf') return
     const t0 = performance.now()
@@ -463,11 +710,40 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
         return
       }
       const { text } = (await res.json()) as { text?: string }
-      const said = (text ?? '').trim()
+      const raw = (text ?? '').trim()
+      const said = wordsIn(raw)
       diag.lastError = ''
 
       if (!said) {
-        drop('nothing intelligible in the segment')
+        drop(raw ? `only background sound — ${raw.slice(0, 40)}` : 'nothing intelligible in the segment')
+        return
+      }
+      if (FILLER.test(said)) {
+        drop(`just a "${said}"`)
+        return
+      }
+
+      // Heard over him. Only "stop" or his name gets through; everything else
+      // — the television, someone else in the room, his own voice — is ignored
+      // and he carries on talking.
+      if (guarded && wordsOnly(h)) {
+        if (!halts(said, speakingNow())) {
+          diag.ignored++
+          drop(`ignored while he talks — "${said.slice(-40)}" (say "stop" or his name)`)
+          return
+        }
+        learnVoice(loudness)
+        diag.heard = said
+        diag.heardAt = Date.now()
+        diag.bargedOn = said
+        diag.bargedOver = speakingNow()
+        diag.dropped = ''
+        diag.accepted++
+        assemble.cancel()
+        h.onSpeechStart()
+        // The app strips his name and takes a bare "stop" as "be quiet"; any
+        // words after them are the next request.
+        h.onUtterance(said)
         return
       }
 
@@ -487,6 +763,7 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
           diag.wakes++
           diag.dropped = ''
           diag.accepted++
+          learnVoice(loudness)
           h.onWake(afterWake(said))
         } else {
           drop(`heard "${said.slice(-40)}" — not his name`)
@@ -494,6 +771,7 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
         return
       }
 
+      if (WAKE.test(said)) learnVoice(loudness)
       // Not a turn yet — a piece of one. The assembler decides when the thought
       // is finished, reading the words and whether the room is still noisy.
       assemble.feed(said, vad?.meter().speaking ?? false)
@@ -522,10 +800,15 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
       const mode = h.mode()
       diag.mode = mode
       diag.sessions++
+      capturingMode = mode
+      capturingGuarded = mode === 'guard' && wordsOnly(h)
       if (mode === 'deaf') return
       // Standing down mid-thought throws the thought away with it. Otherwise
       // held text would surface as the opening of the *next* conversation.
       if (mode === 'wake') assemble.cancel()
+      // Under the stop-words-only rule a sound is not an interruption; the
+      // words decide, once they come back from the transcriber.
+      if (capturingGuarded) return
       // The barge-in. In guard mode the user has started talking over him, and
       // because the guard threshold is high this is a real interruption rather
       // than leaked playback — so cut him off now, do not wait for the words.
@@ -538,8 +821,16 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
         h.onSpeechStart()
       }
     },
-    onEnd: (blob) => {
-      pendingAudio.push(blob)
+    onEnd: (blob, _ms, loudness) => {
+      diag.segmentLevel = loudness
+      // Far quieter than the user ever is: someone or something else. Dropped
+      // here, before it costs a transcription.
+      if (tooFaint(loudness, capturingMode)) {
+        diag.faint++
+        drop(`too quiet to be you (${Math.round((loudness / yourLevel()) * 100)}% of your level)`)
+        return
+      }
+      pendingAudio.push({ blob, guarded: capturingGuarded, loudness })
       void drain()
     },
     onLevel: (v) => {
@@ -699,6 +990,7 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
       else interim += chunk
     }
     const heard = `${settled}${fresh} ${interim}`.replace(/\s+/g, ' ').trim()
+    diag.partial = heard.slice(-120)
     if (!heard) return
     if (isEcho(`${fresh} ${interim}`, speakingNow())) {
       interim = ''
@@ -721,12 +1013,34 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
 
     settled += fresh
     const full = `${settled} ${interim}`.replace(/\s+/g, ' ').trim()
+    // Stop-words-only: nothing but "stop" or his name cuts in, and the turn
+    // that follows starts at that word rather than carrying his echo with it.
+    if (mode === 'guard' && !barged && wordsOnly(h)) {
+      if (!halts(full, speakingNow())) {
+        // Not kept: whatever the television said must not open the next turn.
+        if (fresh) diag.ignored++
+        settled = ''
+        return
+      }
+      const at = HALT.exec(full)?.index ?? 0
+      settled = full.slice(at)
+      interim = ''
+      started = true
+      barged = true
+      diag.bargedOn = settled
+      diag.bargedOver = speakingNow()
+      diag.dropped = ''
+      h.onSpeechStart()
+      h.onPartial(settled)
+      bumpSilence()
+      return
+    }
     if (!started || (mode === 'guard' && !barged)) {
       const words = full.split(/\s+/).filter(Boolean).length
       if (mode === 'guard') {
         // An override word cuts through everything below it — "stop" has to
         // work on the first syllable or it is not a stop button.
-        if (!OVERRIDE.test(full)) {
+        if (!overrides(full, speakingNow())) {
           // His own first syllable, same as the premium path. This engine has
           // no energy gate, so without the clock the only defence is the word
           // count below, and a single clear word is exactly what leaks first.
@@ -741,10 +1055,18 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
           // audio that includes his own playback, and one word of that is not
           // evidence of anything.
           if (words < 2) return
+          if (foreignWords(`${fresh} ${interim}`, speakingNow()) < 2) {
+            diag.selfGuarded++
+            return
+          }
         }
       }
       started = true
-      if (mode === 'guard') barged = true
+      if (mode === 'guard') {
+        barged = true
+        diag.bargedOn = full
+        diag.bargedOver = speakingNow()
+      }
       h.onSpeechStart()
     }
     diag.dropped = ''
@@ -760,7 +1082,7 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
     rec = new Ctor()
     rec.continuous = true
     rec.interimResults = true
-    rec.lang = 'en-GB'
+    rec.lang = caps().language === 'ka' ? 'ka-GE' : 'en-GB'
     rec.onstart = () => {
       running = true
       diag.running = true

@@ -30,8 +30,9 @@ import { getMic } from './audio'
 export type VadHandlers = {
   /** The signal crossed into speech. Instant; this is the barge-in trigger. */
   onStart: () => void
-  /** Speech ended. The blob is one complete, decodable audio file. */
-  onEnd: (audio: Blob, ms: number) => void
+  /** Speech ended. The blob is one complete, decodable audio file. `loudness`
+   *  is the mean level of its voiced frames, on the same scale as `meter().energy`. */
+  onEnd: (audio: Blob, ms: number, loudness: number) => void
   /** 0..1 smoothed input level, for the caption/orb while capturing. */
   onLevel: (v: number) => void
   /** Capture is impossible — no microphone, or no MediaRecorder support. */
@@ -78,6 +79,14 @@ const START_MS = 110
 const SILENCE_MS = 650
 /** Nobody speaks one segment for this long; cut it and transcribe what we have. */
 const MAX_MS = 20000
+/**
+ * While he talks, segments are only searched for "stop" or his name, and a
+ * television that never pauses would otherwise hold one segment open for the
+ * full twenty seconds — with the user's "stop" somewhere inside it, unheard
+ * until the end. Short segments keep the stop word seconds away, not twenty.
+ */
+const GUARD_MAX_MS = 3500
+const GUARD_SILENCE_MS = 450
 
 /** The floor adapts slowly upward (a fan spinning up) and quickly downward (a
  *  door closing), so it settles to genuine ambient noise without chasing speech. */
@@ -142,6 +151,8 @@ export async function startVad(h: VadHandlers): Promise<Vad> {
   let speaking = false
   let speechStartedAt = 0
   let lastLoud = 0
+  let loudSum = 0
+  let loudFrames = 0
   let raf = 0
 
   const rms = (): number => {
@@ -179,8 +190,11 @@ export async function startVad(h: VadHandlers): Promise<Vad> {
   const endSegment = () => {
     const rec = recorder
     const startedAt = speechStartedAt
+    const loudness = loudFrames ? loudSum / loudFrames : 0
     speaking = false
     speechStartedAt = 0
+    loudSum = 0
+    loudFrames = 0
     if (!rec) return
     recorder = null
 
@@ -189,7 +203,7 @@ export async function startVad(h: VadHandlers): Promise<Vad> {
       const blob = new Blob(parts, { type })
       parts = []
       const ms = startedAt ? performance.now() - startedAt : 0
-      h.onEnd(blob, ms)
+      h.onEnd(blob, ms, loudness)
     }
     rec.onstop = finalise
     try {
@@ -202,7 +216,10 @@ export async function startVad(h: VadHandlers): Promise<Vad> {
 
   const tick = () => {
     if (stopped) return
-    raf = requestAnimationFrame(tick)
+    // Animation frames stop in a minimised window, and JARVIS keeps listening
+    // from one. A pending timer just finds `stopped` and returns.
+    if (document.hidden) window.setTimeout(tick, 20)
+    else raf = requestAnimationFrame(tick)
 
     const energy = rms()
     smoothEnergy += (energy - smoothEnergy) * 0.5
@@ -232,6 +249,8 @@ export async function startVad(h: VadHandlers): Promise<Vad> {
           speaking = true
           speechStartedAt = armedAt
           lastLoud = now
+          loudSum = 0
+          loudFrames = 0
           h.onStart()
         }
       } else if (armedAt !== 0) {
@@ -240,10 +259,14 @@ export async function startVad(h: VadHandlers): Promise<Vad> {
         discardRecorder()
       }
     } else {
-      if (smoothEnergy > release) lastLoud = now
+      if (smoothEnergy > release) {
+        lastLoud = now
+        loudSum += smoothEnergy
+        loudFrames++
+      }
       const quietFor = now - lastLoud
       const runFor = now - speechStartedAt
-      if (quietFor >= SILENCE_MS || runFor >= MAX_MS) {
+      if (quietFor >= (guard ? GUARD_SILENCE_MS : SILENCE_MS) || runFor >= (guard ? GUARD_MAX_MS : MAX_MS)) {
         armedAt = 0
         endSegment()
       }

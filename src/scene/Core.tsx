@@ -2,6 +2,8 @@ import { useRef, useMemo } from 'react'
 import { useFrame, useThree } from '@react-three/fiber'
 import * as THREE from 'three'
 import type { Drive } from './Scene'
+import { HUD_STYLE } from '../config'
+import { FIT, LIFT, LOCK_GROW } from './layout'
 
 /**
  * The reactor.
@@ -206,15 +208,9 @@ const fragment = /* glsl */ `
 const HALF = 2.7
 /** Radius, in the shader's own field units, at which the ring is drawn. */
 const RING_R = 0.74
-/**
- * Ring diameter as a fraction of the SHORTER viewport dimension.
- *
- * Framing has to be driven by the viewport rather than by a constant, because
- * the plane is a fixed size in world units while the frame is not: the same
- * scale that leaves a comfortable margin on a 16:9 monitor runs the ring off
- * both edges of a portrait window.
- */
-const FIT = 0.60
+/** How far the disc leans toward the pointer, in radians, at full deflection. */
+const LEAN_X = 0.14
+const LEAN_Y = 0.2
 
 export function Core({ drive }: { drive: Drive }) {
   const mat = useRef<THREE.ShaderMaterial>(null)
@@ -226,7 +222,7 @@ export function Core({ drive }: { drive: Drive }) {
       uColor: { value: new THREE.Color('#19c4c4') },
       // Not white — a tinted highlight keeps the hue readable once bloom
       // stacks on top, instead of washing the ring out to a grey band.
-      uHot: { value: new THREE.Color('#c9fdff') },
+      uHot: { value: new THREE.Color(HUD_STYLE === 'command' ? '#d6ffe2' : '#c9fdff') },
       uLevel: { value: 0 },
       uPhase: { value: 0 },
       uOpen: { value: 0 },
@@ -250,7 +246,11 @@ export function Core({ drive }: { drive: Drive }) {
     // radius inside a fixed quad with dark margin around it, so zooming the
     // field out would push the ring past the quad's own edge and cut it off in
     // a square; moving the quad takes the margin along with it.
-    mesh.current.scale.setScalar(r.scale)
+    mesh.current.scale.setScalar(r.scale * (1 + drive.lock * LOCK_GROW))
+    mesh.current.position.y = viewport.height * LIFT * (1 - drive.lock)
+    // A hologram that turns a few degrees to follow you is what makes a flat
+    // disc read as an object in a room. Zero whenever 3D is off.
+    mesh.current.rotation.set(-drive.look.y * LEAN_X, drive.look.x * LEAN_Y, 0)
 
     const fit = Math.min(viewport.width, viewport.height)
     u.uZoom.value = (RING_R * HALF) / (FIT * 0.5 * fit)

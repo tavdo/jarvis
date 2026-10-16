@@ -1,4 +1,4 @@
-import { createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk'
+import { tool, toolGroup } from './tools/registry.mjs'
 import { z } from 'zod'
 
 /**
@@ -335,16 +335,16 @@ const GOLDEN_ANGLE = 137.507764
  * @param {(op: string, args: object) => void} emit - pushes one ui message
  */
 export function uiServer(emit) {
-  return createSdkMcpServer({
+  return toolGroup({
     name: 'jarvis_ui',
-    version: '1.0.0',
+    label: 'interface',
     instructions:
       'JARVIS\'s control of his own interface — colour, reactor, orbiting ' +
       'images, chrome, effects. Change it when the change carries meaning, ' +
       'and put it back afterwards with ui_reset.',
-    // Same reasoning as the display server: behind tool search it would never
-    // occur to the model that the interface is something it can touch.
-    alwaysLoad: true,
+    // Retinting the interface is the interface talking about itself, not work
+    // done for the user, so none of it is announced on the tool badge.
+    quiet: true,
     tools: [
       tool('ui_theme', THEME_DESCRIPTION, themeSchema, async (args) => {
         const patch = {}

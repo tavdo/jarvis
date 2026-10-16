@@ -1,4 +1,6 @@
 import { create } from 'zustand'
+import { HUD_STYLE } from './config'
+import { prefsNow } from './lib/prefs'
 
 export type Phase =
   | 'offline'   // waiting for the click that unlocks audio
@@ -173,10 +175,14 @@ export type UiPatch = {
  * write rewrote the baseline for the rest of the page's life.
  */
 function defaultUi(): UiState {
+  // The look chosen in Settings is the baseline, so "reset the interface"
+  // comes back to it rather than to the factory colours.
+  const prefs = prefsNow()
   return {
     ...UI_DEFAULTS,
+    accent: prefs.accent,
     palette: { ...UI_DEFAULTS.palette },
-    reactor: { ...UI_DEFAULTS.reactor },
+    reactor: { ...UI_DEFAULTS.reactor, style: prefs.reactorStyle, spin: prefs.reactorSpin },
     orbits: [],
     chrome: { ...UI_DEFAULTS.chrome },
   }
@@ -210,6 +216,17 @@ function defined<T extends object>(patch: T | undefined): Partial<T> {
  */
 const MAX_ORBITS = 8
 
+export type PendingConfirm = {
+  id: string
+  /** One line, e.g. "Delete report.pdf?" */
+  action: string
+  /** What exactly will happen, shown under it. */
+  detail: string
+  /** When the bridge stops waiting and treats silence as no (ms since epoch). */
+  expires: number
+  answer: (approved: boolean) => void
+}
+
 type State = {
   phase: Phase
   /** 0..1 mic loudness, drives the reactor pulse. */
@@ -228,6 +245,9 @@ type State = {
   /** Set while JARVIS is taking a look, to whatever he said he was looking for.
    *  null when he is not. The camera light is on either way — this says why. */
   looking: string | null
+  /** An action JARVIS needs the user to approve, or null. `answer` resolves
+   *  it; only an explicit yes approves. */
+  confirm: PendingConfirm | null
   /** Transient status line during boot, e.g. the voice model download. */
   bootNote: string
   /** Cards currently on the display, newest last. */
@@ -244,6 +264,7 @@ type State = {
   setVoice: (v: string) => void
   setGestures: (on: boolean) => void
   setLooking: (why: string | null) => void
+  setConfirm: (c: PendingConfirm | null) => void
   setBootNote: (n: string) => void
   pushPanel: (p: Panel) => void
   clearPanels: () => void
@@ -281,6 +302,7 @@ export const useStore = create<State>((set) => ({
   voice: '',
   gestures: false,
   looking: null,
+  confirm: null,
   panels: [],
   blades: [],
   focusedBlade: null,
@@ -291,6 +313,7 @@ export const useStore = create<State>((set) => ({
   setVoice: (voice) => set({ voice }),
   setGestures: (gestures) => set({ gestures }),
   setLooking: (looking) => set({ looking }),
+  setConfirm: (confirm) => set({ confirm }),
   setBootNote: (bootNote) => set({ bootNote }),
   // Three is as many as fits around the reactor without crowding it. Sticky
   // panels are exempt from the cull — the tool description promises they stay
@@ -416,16 +439,30 @@ export const useStore = create<State>((set) => ({
 }))
 
 /** Colour identity per phase — shared by the 3D scene and the 2D HUD. */
-export const phaseColor: Record<Phase, string> = {
-  offline: '#0d4a4a',
-  boot: '#17b3b3',
-  dormant: '#12908f',
-  waking: '#5cf2ef',
-  listening: '#19d8d2',
-  thinking: '#f0a93c',
-  tooling: '#a97bff',
-  speaking: '#3ef2a8',
-}
+export const phaseColor: Record<Phase, string> =
+  HUD_STYLE === 'command'
+    ? {
+        // One hue, phosphor green, with the phases told apart by brightness
+        // and a lean toward lime (thinking) or teal (tools).
+        offline: '#0b4a24',
+        boot: '#1fc463',
+        dormant: '#18a854',
+        waking: '#6dffa4',
+        listening: '#2ef27f',
+        thinking: '#b8ff4a',
+        tooling: '#3dffc8',
+        speaking: '#47ff8c',
+      }
+    : {
+        offline: '#0d4a4a',
+        boot: '#17b3b3',
+        dormant: '#12908f',
+        waking: '#5cf2ef',
+        listening: '#19d8d2',
+        thinking: '#f0a93c',
+        tooling: '#a97bff',
+        speaking: '#3ef2a8',
+      }
 
 /**
  * What colour is the interface right now.

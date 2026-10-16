@@ -1,4 +1,4 @@
-import { useMemo } from 'react'
+import { useEffect, useMemo } from 'react'
 import { Canvas, useFrame } from '@react-three/fiber'
 import {
   EffectComposer,
@@ -12,7 +12,10 @@ import * as THREE from 'three'
 import { Core } from './Core'
 import { Particles } from './Particles'
 import { Orbits } from './Orbits'
+import { Depth } from './Depth'
 import { useStore, phaseColor, accentFor, type Phase } from '../store'
+import { prefsNow } from '../lib/prefs'
+import { useLock } from '../lib/lock'
 
 /** Rings spin harder while JARVIS is working — reads as effort. */
 const spinFor: Record<Phase, number> = {
@@ -84,6 +87,15 @@ export type Drive = {
     style: number
     visible: boolean
   }
+  /**
+   * The pointer, smoothed, -1..1 on both axes, already scaled by `depth` — so
+   * everything that leans toward it simply stops leaning when 3D is off.
+   */
+  look: THREE.Vector2
+  /** 0..1, eased: how much of the 3D layer is showing (Settings → 3D DEPTH). */
+  depth: number
+  /** 0..1, eased: the passcode screen is up, and the ring centres behind it. */
+  lock: number
 }
 
 /**
@@ -122,9 +134,28 @@ function Rig() {
         style: STYLE_INDEX.ring,
         visible: true,
       },
+      look: new THREE.Vector2(),
+      depth: prefsNow().depth3d ? 1 : 0,
+      lock: 0,
     }),
     [],
   )
+
+  // Read from the window, not the canvas: the deck sits on top of the scene
+  // and takes every pointer event, so r3f's own pointer never moves.
+  const pointer = useMemo(() => new THREE.Vector2(), [])
+  useEffect(() => {
+    const move = (e: PointerEvent) => {
+      pointer.set((e.clientX / window.innerWidth) * 2 - 1, 1 - (e.clientY / window.innerHeight) * 2)
+    }
+    const leave = () => pointer.set(0, 0)
+    window.addEventListener('pointermove', move)
+    document.documentElement.addEventListener('pointerleave', leave)
+    return () => {
+      window.removeEventListener('pointermove', move)
+      document.documentElement.removeEventListener('pointerleave', leave)
+    }
+  }, [pointer])
   const target = useMemo<Tint>(() => ({ key: '', color: new THREE.Color() }), [])
   const reactorTarget = useMemo<Tint>(
     () => ({ key: '', color: new THREE.Color() }),
@@ -169,23 +200,32 @@ function Rig() {
     const want = Math.max(level, breathe)
     drive.level += (want - drive.level) * Math.min(1, dt * 9)
 
-    // Slow drift on the camera keeps handheld-ish life in the shot.
+    drive.depth += ((prefsNow().depth3d ? 1 : 0) - drive.depth) * Math.min(1, dt * 3)
+    drive.lock += ((useLock.getState().locked ? 1 : 0) - drive.lock) * Math.min(1, dt * 2.4)
+    drive.look.x += (pointer.x * drive.depth - drive.look.x) * Math.min(1, dt * 2.2)
+    drive.look.y += (pointer.y * drive.depth - drive.look.y) * Math.min(1, dt * 2.2)
+
+    // Slow drift on the camera keeps handheld-ish life in the shot; the
+    // pointer adds parallax, so the dust and the gyro rings slide past each
+    // other at their own depths. Small on purpose — the deck draws its globe
+    // inside the ring, and the ring must stay over it.
     const t = state.clock.elapsedTime
-    state.camera.position.x = Math.sin(t * 0.13) * 0.35
-    state.camera.position.y = Math.cos(t * 0.17) * 0.22
+    state.camera.position.x = Math.sin(t * 0.13) * 0.35 + drive.look.x * 0.45
+    state.camera.position.y = Math.cos(t * 0.17) * 0.22 + drive.look.y * 0.28
     state.camera.lookAt(0, 0, 0)
   })
 
   // Nothing in here is lit: both the core and the dust are raw ShaderMaterials,
   // which do not read the light list. The scene therefore has no lights at all.
   //
-  // The tilted gyro rings that used to sit here are gone. Steeply tilted arcs
-  // crossing in front of a complete circle do not read as depth — they read as
-  // scratches on the lens, and as broken circles in a design whose whole
-  // subject is one unbroken one.
+  // The depth layer (gyro rings, core lattice) is the second attempt at rings
+  // around the reactor. The first drew flat arcs at one brightness, which read
+  // as scratches on the lens rather than as depth; these are complete circles
+  // that dim as they pass behind the core, and that is what sells them as 3D.
   return (
     <>
       <Core drive={drive} />
+      <Depth drive={drive} />
       <Particles drive={drive} />
       <Orbits />
     </>
